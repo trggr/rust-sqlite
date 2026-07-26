@@ -1,7 +1,8 @@
 use csv::ReaderBuilder;
+use itertools::Itertools;
 use serde::Deserialize;
 use std::error::Error;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 
 #[derive(Debug, Deserialize)]
@@ -19,28 +20,26 @@ struct User {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // 1. Configure SQLite for raw write speed
     let mut conn = rusqlite::Connection::open("sqlite.db")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
 
     conn.execute(
-        "create table if not exists user (
-            user_id text primary key,
-            user_nm text not null,
-            amt integer not null
+        "CREATE TABLE IF NOT EXISTS user (
+            user_id TEXT PRIMARY KEY,
+            user_nm TEXT NOT NULL,
+            amt INTEGER NOT NULL
         )",
         [],
     )?;
 
-    let mut reject_file = OpenOptions::new()
+    let reject_file = OpenOptions::new()
         .create(true)
         .append(true)
         .open("rejected_users.txt")?;
 
-    // 2. Stream & transform lazily via owned Iterator combinators
-    let records = ReaderBuilder::new()
+    ReaderBuilder::new()
         .has_headers(true)
         .from_path("users.csv")?
         .into_deserialize::<RawRecord>()
@@ -54,60 +53,43 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }),
                 None => Err("Missing or invalid 'amt' value".to_string()),
             })
-        });
-
-    // 3. Process in transactional batches (10k items per batch for peak SQLite throughput)
-    let batch_size = 10_000;
-    let mut current_batch = Vec::with_capacity(batch_size);
-
-    for result in records {
-        let _ = result
-            .inspect(|user| current_batch.push(User {
-                user_id: user.user_id.clone(),
-                user_nm: user.user_nm.clone(),
-                amt: user.amt,
-            }))
-            .inspect_err(|err| {
-                let _ = writeln!(reject_file, "REJECTED: {}", err);
-            });
-
-        if current_batch.len() >= batch_size {
-            flush_batch(&mut conn, &mut current_batch, &mut reject_file)?;
-        }
-    }
-
-    // Flush remaining records
-    if !current_batch.is_empty() {
-        flush_batch(&mut conn, &mut current_batch, &mut reject_file)?;
-    }
-
-    Ok(())
+        })
+        .filter_map(|res| {
+            res.inspect_err(|err| {
+                let _ = writeln!(&reject_file, "REJECTED: {}", err);
+            })
+            .ok()
+        })
+        .chunks(10_000)
+        .into_iter()
+        .fold(Ok(()), |acc, chunk| {
+            acc.and_then(|_| process_transaction_chunk(&mut conn, chunk, &reject_file))
+        })
 }
 
-fn flush_batch(
+fn process_transaction_chunk(
     conn: &mut rusqlite::Connection,
-    batch: &mut Vec<User>,
-    reject_file: &mut std::fs::File,
+    chunk: impl Iterator<Item = User>,
+    reject_file: &File,
 ) -> Result<(), Box<dyn Error>> {
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare(
-            "insert into user (user_id, user_nm, amt) values (:1, :2, :3)",
+            "INSERT INTO user (user_id, user_nm, amt) VALUES (?1, ?2, ?3)",
         )?;
 
-        batch.drain(..)
-            .for_each(|user| {
-                stmt.execute(rusqlite::params![user.user_id, user.user_nm, user.amt])
+        chunk.for_each(|user| {
+            stmt.execute(rusqlite::params![user.user_id, user.user_nm, user.amt])
                 .map(|_| ())
                 .inspect_err(|err| {
+                    let mut writer = reject_file;
                     let _ = writeln!(
-                        reject_file,
+                        writer,
                         "DB INSERT FAILED [id: {}]: {}",
                         user.user_id, err
                     );
                 })
-                .or_else(|_| Ok::<(), rusqlite::Error>(()))
-                .unwrap();
+                .unwrap_or(());
         });
     }
     tx.commit()?;
