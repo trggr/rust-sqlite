@@ -1,4 +1,4 @@
-@echo off
+rem @echo off
 REM Run script for ora_rust
 
 setlocal enabledelayedexpansion
@@ -9,4 +9,5 @@ if not defined CARGO_HOME (
 )
 
 rem cargo run --release -- -c bdev -f data\odpic_test.dat
-cargo run --release -- -d data.db -f data\sample.dat
+rem cargo run --release -- -d data.db -f data\sample.dat
+cargo run

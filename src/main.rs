@@ -6,7 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 
 #[derive(Debug, Deserialize)]
-struct RawRecord {
+struct CSVRecord {
     user_id: String,
     user_nm: String,
     amt: Option<i64>,
@@ -18,84 +18,91 @@ struct User {
     user_nm: String,
     amt: i64,
 }
+use rusqlite::Connection;
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = rusqlite::Connection::open("sqlite.db")?;
+fn open_db() -> Result<Connection, Box<dyn Error>> {
+    let conn = Connection::open("sqlite.db")?;
+
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
 
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS user (
-            user_id TEXT PRIMARY KEY,
-            user_nm TEXT NOT NULL,
-            amt INTEGER NOT NULL
+        "create table if not exists user (
+            user_id text primary key,
+            user_nm text not null,
+            amt integer not null
         )",
         [],
     )?;
 
+    Ok(conn)
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = open_db()?;
+    
     let reject_file = OpenOptions::new()
         .create(true)
         .append(true)
         .open("rejected_users.txt")?;
 
-    let _ = ReaderBuilder::new()
+    ReaderBuilder::new()
         .has_headers(true)
         .from_path("users.csv")?
-        .into_deserialize::<RawRecord>()
-        .map(|res| res.map_err(|e| e.to_string()))
-        .map(|res| {
-            res.and_then(|raw| match raw.amt {
-                Some(amt) => Ok(User {
-                    user_id: raw.user_id,
-                    user_nm: raw.user_nm,
-                    amt,
-                }),
-                None => Err("Missing or invalid 'amt' value".to_string()),
-            })
-        })
-        .filter_map(|res| {
-            res.inspect_err(|err| {
-                let _ = writeln!(&reject_file, "REJECTED: {}", err);
-            })
-            .ok()
+        .deserialize::<CSVRecord>()
+        .filter_map(|res| match res {
+            Ok(r) => match r.amt {
+                Some(amt) => Some(User {user_id: r.user_id,
+                                        user_nm: r.user_nm,
+                                        amt}),
+                None => {
+                    let _ = writeln!(&reject_file, "REJECTED: Missing or invalid 'amt' value");
+                    None
+                }
+            },
+            Err(e) => {
+                let _ = writeln!(&reject_file, "REJECTED: {}", e);
+                None
+            }
         })
         .chunks(10_000)
         .into_iter()
-        .fold(Ok(()), |acc, chunk| {
-            acc.and_then(|_| process_transaction_chunk(&mut conn, chunk, &reject_file))
-        });
-    Ok(())
+        .try_for_each(|chunk| bulk_insert(&mut conn, chunk, &reject_file))
 }
+
 fn main() {
     let _rc = run();
 }
 
-fn process_transaction_chunk(
+// SQLite's way to bulk insert records is to use a single commit at the end of
+// transaction. INSER OR IGNORE statement means a record maybe rejected,
+// but the batch continues and good rows are committed
+fn bulk_insert(
     conn: &mut rusqlite::Connection,
     chunk: impl Iterator<Item = User>,
-    reject_file: &File,
+    mut reject_file: &File,
 ) -> Result<(), Box<dyn Error>> {
     let tx = conn.transaction()?;
+
     {
-        let mut stmt = tx.prepare(
-            "insert into user (user_id, user_nm, amt) values (?1, ?2, ?3)",
+        let mut insert = tx.prepare_cached(
+            "insert or ignore into user (user_id, user_nm, amt) values (?1, ?2, ?3)",
         )?;
 
-        chunk.for_each(|user| {
-            stmt.execute(rusqlite::params![user.user_id, user.user_nm, user.amt])
-                .map(|_| ())
-                .inspect_err(|err| {
-                    let mut writer = reject_file;
-                    let _ = writeln!(
-                        writer,
-                        "DB INSERT FAILED [id: {}]: {}",
-                        user.user_id, err
-                    );
-                })
-                .unwrap_or(());
-        });
+        for user in chunk {
+            let rows_affected = insert.execute(rusqlite::params![user.user_id, user.user_nm, user.amt])?;
+
+            if rows_affected == 0 {
+                let _ = writeln!(
+                    reject_file,
+                    "INSERT IGNORED: unique constraint violation? [id: {}]",
+                    user.user_id
+                );
+            }
+        }
     }
+
     tx.commit()?;
     Ok(())
 }
