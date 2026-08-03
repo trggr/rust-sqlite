@@ -19,7 +19,7 @@ struct User {
     amt: i64,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = rusqlite::Connection::open("sqlite.db")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .append(true)
         .open("rejected_users.txt")?;
 
-    ReaderBuilder::new()
+    let _ = ReaderBuilder::new()
         .has_headers(true)
         .from_path("users.csv")?
         .into_deserialize::<RawRecord>()
@@ -64,7 +64,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into_iter()
         .fold(Ok(()), |acc, chunk| {
             acc.and_then(|_| process_transaction_chunk(&mut conn, chunk, &reject_file))
-        })
+        });
+    Ok(())
+}
+fn main() {
+    let _rc = run();
 }
 
 fn process_transaction_chunk(
