@@ -1,0 +1,10 @@
+I write Rust in a human-readable, Clojure-inspired functional style. My core constraints:
+- ETL & streaming data pipelines using iterator combinators (map, flat_map, filter, fold).
+- Zero lifetime annotations ('a): Always prefer owned data (String, Vec) transferred via .into_iter().
+- Monadic error handling with Result/Option, using inspect() for logging and or_else() for recovery.
+- Maximum performance with single-pass, lazy streaming and no temporary allocations.
+
+can you make me a rust program that loads users from a 200K CSV-file (user_id, user_nm, amt) 
+into sqlite table called "user", fields user_id string, user_nm string, amt integer. 
+The sqlite database is on disk "sqlite.db" with a maximum speed possible. 
+Make the program ETL style, if some records are rejected - store them in rejected_users.txt.

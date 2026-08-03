@@ -75,7 +75,7 @@ fn process_transaction_chunk(
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO user (user_id, user_nm, amt) VALUES (?1, ?2, ?3)",
+            "insert into user (user_id, user_nm, amt) values (?1, ?2, ?3)",
         )?;
 
         chunk.for_each(|user| {
